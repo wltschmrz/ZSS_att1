@@ -581,14 +581,14 @@ if __name__ == "__main__":
         'REPRESENTATION': 'fourier',
     }
 
-    pkboo_h_prms = {
-        'GRAVITY': 6e-3,  # 1e-1/2,
-        'NUM_ITER': 300,
-        'LEARNING_RATE': 0.01,  # 1e-5, 
-        'BATCH_SIZE': 1,
-        'GUIDANCE_SCALE': 100,
-        'REPRESENTATION': 'raster',
-    }
-    ## raster 기준 (GRAVITY: 0.1 / LEARNING_RATE: 0.01) 까지는 e가 1에서 진동
+    # pkboo_h_prms = {
+    #     'GRAVITY': 6e-3,  # 1e-1/2,
+    #     'NUM_ITER': 300,
+    #     'LEARNING_RATE': 0.01,  # 1e-5, 
+    #     'BATCH_SIZE': 1,
+    #     'GUIDANCE_SCALE': 100,
+    #     'REPRESENTATION': 'raster',
+    # }
+    ## raster 기준 (GRAVITY: 0.05 / LEARNING_RATE: 1)
 
     run_pkboo(config_yaml, config_yaml_path, exp_group_name, exp_name, perform_validation, **pkboo_h_prms)
