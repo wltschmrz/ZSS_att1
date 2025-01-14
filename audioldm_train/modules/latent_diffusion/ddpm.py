@@ -712,17 +712,19 @@ class LatentDiffusion(DDPM):
         num_timesteps_cond=None,
         cond_stage_key="image",
         optimize_ddpm_parameter=True,
+        unconditional_prob_cfg=0.1,
         warmup_steps=10000,
         concat_mode=True,
         cond_stage_forward=None,
         conditioning_key=None,
         scale_factor=1.0,
+        batchsize=None,
         base_learning_rate=None,
         scale_by_std=False,
         evaluation_params={},
         *args,
         **kwargs,
-    ):  # unconditional_prob_cfg=0.1,
+    ):
 
         self.learning_rate = base_learning_rate
         self.num_timesteps_cond = default(num_timesteps_cond, 1)
@@ -735,7 +737,9 @@ class LatentDiffusion(DDPM):
 
         assert self.num_timesteps_cond <= kwargs["timesteps"]
 
-        self.conditioning_key = list(cond_stage_config.keys())  # 조건부 설정
+        conditioning_key = list(cond_stage_config.keys())
+        
+        self.conditioning_key = conditioning_key  # 조건부 설정
 
         ckpt_path = kwargs.pop("ckpt_path", None)  # 부모 클래스 초기화
         ignore_keys = kwargs.pop("ignore_keys", [])
@@ -918,11 +922,14 @@ class LatentDiffusion(DDPM):
 
         cond_dict = {}
         if len(self.cond_stage_model_metadata.keys()) > 0:
-            print(self.cond_stage_model_metadata.keys())  #####
+            # print(self.cond_stage_model_metadata.keys())  ##### dict_keys(['film_clap_cond1'])
             
-            unconditional_cfg = self.conditional_dry_run_finished and self.make_decision(unconditional_prob_cfg)  # True/False
-            print(f"unconditional_cfg is {unconditional_cfg} & {self.conditional_dry_run_finished}/{self.make_decision(unconditional_prob_cfg)}")  #####
-            
+            # unconditional_cfg = self.conditional_dry_run_finished and self.make_decision(unconditional_prob_cfg)  # True/False
+            # print(f"unconditional_cfg is {unconditional_cfg} & {self.conditional_dry_run_finished}/{self.make_decision(unconditional_prob_cfg)}")  ##### unconditional_cfg is False & False/False
+            unconditional_cfg = self.make_decision(unconditional_prob_cfg)
+            assert self.make_decision(unconditional_prob_cfg) == int(unconditional_prob_cfg)
+            # print(self.make_decision(unconditional_prob_cfg), int(unconditional_prob_cfg))
+
             # Process each conditional model
             for cond_model_key, metadata in self.cond_stage_model_metadata.items():
                 if cond_model_key in cond_dict:
@@ -931,8 +938,8 @@ class LatentDiffusion(DDPM):
                 # Get conditional input (conditioning에 사용될 original data, cond_model_key: "all"이면 cond_model이 batch의 모든 정보를 필요로 함)
                 cond_stage_key = metadata["cond_stage_key"]
                 xc = batch if cond_stage_key == "all" else super().get_input(batch, cond_stage_key)
-                print(f'cond_stage_key:{cond_stage_key}')  #####
-                print(f'xc:{xc}')  #####
+                # print(f'cond_stage_key:{cond_stage_key}')  ##### cond_stage_key:text
+                # print(f'xc:{xc}')  ##### xc:['A baby crying and whining']
 
                 if isinstance(xc, torch.Tensor):
                     xc = xc.to(self.device)

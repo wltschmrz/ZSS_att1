@@ -20,7 +20,7 @@ from pytorch_lightning import seed_everything
 from tqdm import tqdm
 
 # 프로젝트 내부 모듈
-from audioldm_train.utilities.data.dataset import AudioDataset
+from audioldm_train.utilities.data.dataset import AudioDataset, spectral_normalize_torch
 from audioldm_train.utilities.model_util import instantiate_from_config
 from audioldm_train.utilities.tools import get_restore_step, copy_test_subset_data
 from peekaboo.mask_generation import LearnableImageFourier, LearnableImageRaster
@@ -56,8 +56,8 @@ class AudioPeekabooSeparator(nn.Module):
 
         super().__init__()
         self.data = data  # data['log_mel_spec']: [B,1024,64] / data['stft']: [B,t-steps,f-bins]
-        self.height = data['stft'].shape[1]  # 1024
-        self.width = data['stft'].shape[2]  # 64 X -> 1024
+        self.height = data['stft'].shape[1]  # 1024 -> 513
+        self.width = data['stft'].shape[2]  # 64 X -> 1024 -> 512 -> 1024
         self.dataset = dataset
         self.device = device
         self.num_label = num_label  # 1
@@ -66,7 +66,7 @@ class AudioPeekabooSeparator(nn.Module):
         # self.foreground = data['log_mel_spec'].to(device)  # [1, t-steps, mel-bins]
         # self.alpha = make_learnable_image(self.height, self.width, num_channels=self.num_label, representation=self.representation)  # [num_label, H, W]
         self.foreground = data['stft'].to(device)  # tensor, [B, t-steps, f-bins]
-        self.alpha = LearnableImageRaster(self.height, self.width, self.num_label)
+        self.alpha = make_learnable_image(self.height, self.width, self.num_label, representation)
 
     @property
     def num_labels(self):
@@ -74,11 +74,18 @@ class AudioPeekabooSeparator(nn.Module):
         
     def forward(self, alpha=None, return_alpha=False):        
         alpha = alpha if alpha is not None else self.alpha()
-        masked_log_mel_spec = masking_torch_image(self.foreground, alpha)
+        masked_stft = masking_torch_image(self.foreground, alpha)
 
-        self.data['stft'] = masked_log_mel_spec.float()
-        mel = self.dataset.spectral_normalize_torch(torch.matmul(self.dataset.mel_basis[str(self.dataset.mel_fmax) + "_" + str(self.device)], masked_log_mel_spec))
-        self.data['log_mel_spec'] = self.dataset.pad_spec(torch.FloatTensor(mel[0].T)).unsqueeze(0).float()
+        self.data['stft'] = masked_stft.float()
+        # print(self.dataset.mel_basis[str(self.dataset.mel_fmax) + "_" + str('cpu')].shape)
+        # print(self.dataset.mel_basis[str(self.dataset.mel_fmax) + "_" + str('cpu')].to(self.device).shape)
+        # print(masked_stft.shape)
+
+        mel = spectral_normalize_torch(torch.matmul(self.dataset.mel_basis[str(self.dataset.mel_fmax) + "_" + str('cpu')].to(self.device), masked_stft))
+        masked_log_mel_spec = self.dataset.pad_spec(mel[0].T).unsqueeze(0).float()
+        original_shape = self.data['log_mel_spec'].shape
+        assert self.data['log_mel_spec'].shape == masked_log_mel_spec.shape, f'{original_shape} != {masked_log_mel_spec.shape}'
+        self.data['log_mel_spec'] = masked_log_mel_spec
 
         assert not torch.isnan(alpha).any() or not torch.isinf(alpha).any(), "alpha contains NaN or Inf values"  # NaN이나 Inf 값 체크
 
@@ -96,9 +103,9 @@ def get_mixed_batches(batch1, batch2, dataset, snr_db=0, device=None):
     mixed_wav = (mixed * 0.5).float()
     log_mel_spec, stft = dataset.mel_spectrogram_train(mixed_wav[0, ...])
     log_mel_spec = dataset.pad_spec(torch.FloatTensor(log_mel_spec.T)).unsqueeze(0).float()
-    stft = dataset.pad_spec(torch.FloatTensor(stft.T)).unsqueeze(0).float()
+    # stft = dataset.pad_spec(torch.FloatTensor(stft.T)).unsqueeze(0).float()  #####
     if device:
-        mixed_wav, log_mel_spec, stft = mixed_wav.to(device), log_mel_spec.to(device), stft.to(device)
+        mixed_wav, log_mel_spec, stft = mixed_wav.to(device), log_mel_spec.to(device), stft.unsqueeze(0).float().to(device)  #####
     def set_dict(batch):
         label_vector = batch["label_vector"].float()
         if device:
@@ -143,7 +150,8 @@ def setting_result_folder(fname: str):
 
 def save_melspec_as_img(mel_tensor, save_path):
     mel = mel_tensor.detach().cpu().numpy()
-    mel = mel.T  # (64, 1024)로 전치
+    if mel.shape[0] > mel.shape[1]:
+        mel = mel.T  # (64, 1024)로 전치
     height, width = mel.shape
     aspect_ratio = width / height  # 1024/64 = 16
     fig_width = 20  # 기준 가로 길이
@@ -185,7 +193,7 @@ def save_intermediate_results(iter_idx, alpha, composite_batch, f_alpha, f_sep_m
         save_melspec_as_img(alpha_cpu, os.path.join(f_alpha, f"{iter_idx:04d}.png"))
         save_melspec_as_img(mel_cpu, os.path.join(f_sep_mel, f"{iter_idx:04d}.png"))
 
-def save_final_results(composite_batch, fname, losses1, losses2, latent_diffusion):
+def save_final_results(composite_batch, fname, losses1, losses2, p, n, p2, n2, latent_diffusion):
     """최종 결과 저장"""
     try:
         mel = composite_batch['log_mel_spec'].unsqueeze(0).to(latent_diffusion.device)
@@ -203,11 +211,32 @@ def save_final_results(composite_batch, fname, losses1, losses2, latent_diffusio
 
         # Loss plot 저장
         save_loss_plot(losses1, losses2, os.path.join(fname, "loss.png"))
+        save_loss_plot_together(p, n, os.path.join(fname, "noises_mean.png"))
+        save_loss_plot_together(p2, n2, os.path.join(fname, "noises_abs_mean.png"))
     except Exception as e:
         print(f"결과 저장 중 에러 발생: {e}")
 
+def save_loss_plot_together(p, n, save_path):
+    plt.figure(figsize=(10, 6))
+    try:
+        pred = np.array(p)
+        noise = np.array(n)
+
+        plt.plot(pred, label="Predicted Noise")
+        plt.plot(noise, label="Gaussian Noise", color='red')
+        plt.title("Noises")
+        plt.xlabel("Iteration")
+        plt.ylabel("Value")
+        plt.legend()
+
+        plt.tight_layout()
+        plt.savefig(save_path)
+    except Exception as e:
+        print(f"Loss plot 저장 중 에러 발생: {e}")
+    finally:
+        plt.close()
+
 def save_loss_plot(losses1, losses2, save_path):
-    """Loss plot 저장"""
     plt.figure(figsize=(10, 6))
     try:
         losses1_np = np.array(losses1)
@@ -289,7 +318,7 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
 
     # 데이터 로더 설정
     dataset = AudioDataset(configs, split="train", add_ons=dataloader_add_ons)
-    loader = DataLoader(dataset, batch_size=batch_size, num_workers=16, pin_memory=True, shuffle=True)
+    loader = DataLoader(dataset, batch_size=batch_size, num_workers=1, pin_memory=True, shuffle=True)
     
     # 데이터셋 길이와 배치 사이즈 출력
     print(f"The length of the dataset is {len(dataset)}, the length of the dataloader is {len(loader)}, the batchsize is {batch_size}")
@@ -328,6 +357,8 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
 
     sep_data1, sep_data2 = get_mixed_batches(batch1, batch2, dataset, snr_db=0, device=device)    
 
+    global same_count
+    same_count = 0
     # hyper parameter setting
     GRAVITY=kwargs['GRAVITY']
     NUM_ITER=kwargs['NUM_ITER']
@@ -346,6 +377,10 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
     
     losses1 = np.zeros(NUM_ITER)
     losses2 = np.zeros(NUM_ITER)
+    preds_mean = np.zeros(NUM_ITER)
+    noises_mean = np.zeros(NUM_ITER)
+    preds_absmean = np.zeros(NUM_ITER)
+    noises_absmean = np.zeros(NUM_ITER)
 
     NUM_PREVIEWS = 10
     preview_interval = max(1, NUM_ITER // NUM_PREVIEWS)  # 10번의 미리보기를 표시
@@ -362,7 +397,7 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
             # for __ in range(BATCH_SIZE):
             if BATCH_SIZE == 1:
                 composite_batch = pkboo()
-                noise_mse_loss = training_step(composite_batch, latent_diffusion, guidance_scale=GUIDANCE_SCALE)  # 가이던스 스케일 조정하는거 확인 부탁
+                noise_mse_loss, pred, noise, pred_abs, noise_abs = training_step(composite_batch, latent_diffusion, guidance_scale=GUIDANCE_SCALE)  # 가이던스 스케일 조정하는거 확인 부탁
             else:
                 raise ValueError
 
@@ -378,6 +413,10 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
                 whenstartdiverge = iter_idx
                 trigger = 1
             losses2[iter_idx] = alpha_reg_loss
+            preds_mean[iter_idx] = pred
+            noises_mean[iter_idx] = noise
+            preds_absmean[iter_idx] = pred_abs
+            noises_absmean[iter_idx] = noise_abs
         
             with torch.no_grad():
                 if not iter_idx % preview_interval:
@@ -395,9 +434,13 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
             fname,
             losses1,
             losses2,
+            preds_mean,
+            noises_mean,
+            preds_absmean,
+            noises_absmean,
             latent_diffusion
         )
-        print(whenstartdiverge)
+        print(whenstartdiverge, same_count)
 
     except KeyboardInterrupt:
         print("\nInterrupted by user. Saving current results...")
@@ -406,6 +449,10 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
             fname,
             losses1[:iter_idx],
             losses2[:iter_idx],
+            preds_mean[:iter_idx],
+            noises_mean[:iter_idx],
+            preds_absmean[:iter_idx],
+            noises_absmean[:iter_idx],
             latent_diffusion
         )
 
@@ -473,21 +520,25 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
         return 0  # dummy loss value
 '''
 def training_step(composite_batch, latent_diffusion, guidance_scale=100):
+    global same_count
 
     x, cond = latent_diffusion.get_input(composite_batch, latent_diffusion.first_stage_key, unconditional_prob_cfg=0.0)
-    print(cond.keys())
-    print(cond[0])
-    x, uncond = latent_diffusion.get_input(composite_batch, latent_diffusion.first_stage_key, unconditional_prob_cfg=0.0)
-    print(uncond.keys())
-    print(uncond[0])
+    # print(cond.keys())  # dict_keys(['film_clap_cond1'])
+    # print(cond['film_clap_cond1'])
+    _, uncond = latent_diffusion.get_input(composite_batch, latent_diffusion.first_stage_key, unconditional_prob_cfg=1.0)
+    # print(uncond.keys())  # dict_keys(['film_clap_cond1'])
+    # print(uncond['film_clap_cond1'])
 
-    assert cond[0] != uncond[0], f'Cond:\n{cond[0]}\n\nUncond\n{uncond[0]}'
+    co, unco = cond['film_clap_cond1'], uncond['film_clap_cond1']
+    # assert not torch.equal(co, unco), f'Cond:\n{co}\n\nUncond\n{unco}'
+    if torch.equal(co, unco):
+        same_count += 1
 
     with torch.no_grad():
         t = torch.randint(int(latent_diffusion.num_timesteps * 0.02), int(latent_diffusion.num_timesteps * 0.98) + 1 , (x.shape[0],), device=latent_diffusion.device).long()         ############   t 조정
         noise = torch.randn_like(x)
         x_noisy = latent_diffusion.q_sample(x_start=x, t=t, noise=noise)
-        print(x_noisy.shape())
+        # print(x_noisy.shape)  # torch.Size([1, 8, 256, 16])
         pred_noise_text = latent_diffusion.apply_model(x_noisy, t, cond)
         pred_noise_uncond = latent_diffusion.apply_model(x_noisy, t, uncond)
         pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_text - pred_noise_uncond)
@@ -495,13 +546,13 @@ def training_step(composite_batch, latent_diffusion, guidance_scale=100):
     # w(t), sigma_t^2 
     w = (1 - latent_diffusion.alphas_cumprod[t])
     grad = w * (pred_noise - noise)
+    x.backward(gradient=grad, retain_graph=True)
 
     custom_mse_loss = ((pred_noise - noise) ** 2).mean().item()
 
     # grad에서 item을 생략하고 자동 미분 불가능하므로, 수동 backward 수행.
-    x.backward(gradient=grad, retain_graph=True)
     
-    return custom_mse_loss  # dummy loss value
+    return custom_mse_loss, pred_noise.mean().item(), noise.mean().item(), pred_noise.abs().mean().item(), noise.abs().mean().item()  # dummy loss value
 
 
 if __name__ == "__main__":
@@ -522,9 +573,18 @@ if __name__ == "__main__":
         config_yaml["step"]["limit_val_batches"] = None
 
     pkboo_h_prms = {
-        'GRAVITY': 5e-2,  # 1e-1/2,
-        'NUM_ITER': 600,
-        'LEARNING_RATE': 8e-5,  # 1e-5, 
+        'GRAVITY': 1e-1/2,  # 1e-1/2,
+        'NUM_ITER': 300,
+        'LEARNING_RATE': 1e-6,  # 1e-5, 
+        'BATCH_SIZE': 1,
+        'GUIDANCE_SCALE': 100,
+        'REPRESENTATION': 'fourier',
+    }
+
+    pkboo_h_prms = {
+        'GRAVITY': 6e-3,  # 1e-1/2,
+        'NUM_ITER': 300,
+        'LEARNING_RATE': 0.01,  # 1e-5, 
         'BATCH_SIZE': 1,
         'GUIDANCE_SCALE': 100,
         'REPRESENTATION': 'raster',

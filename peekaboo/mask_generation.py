@@ -236,8 +236,8 @@ class LearnableImageRaster(LearnableImage):
     def __init__(self, height: int, width: int, num_channels: int = 1):
         super().__init__(height, width, num_channels)
         # 랜덤 초기화된 이미지를 학습 가능한 파라미터로 설정
-        # self.image = nn.Parameter(torch.randn(num_channels, height, width))                 ###############
-        self.image = nn.Parameter(torch.full((num_channels, height, width), 0.8))
+        self.image = nn.Parameter(torch.randn(num_channels, height, width))                 #####
+        # self.image = nn.Parameter(torch.full((num_channels, height, width), 0.8))
         
     def forward(self):
         # 이미지 파라미터를 복사하여 반환
