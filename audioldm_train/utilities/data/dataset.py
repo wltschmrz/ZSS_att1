@@ -435,11 +435,7 @@ class AudioDataset(Dataset):
 
         stft_spec = torch.abs(stft_spec)
 
-        mel = spectral_normalize_torch(
-            torch.matmul(
-                self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)], stft_spec
-            )
-        )
+        mel = spectral_normalize_torch(torch.matmul(self.mel_basis[str(self.mel_fmax) + "_" + str(y.device)], stft_spec))
 
         return mel[0], stft_spec[0]
 

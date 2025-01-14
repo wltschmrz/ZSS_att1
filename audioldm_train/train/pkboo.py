@@ -49,20 +49,25 @@ def masking_torch_image(foreground, alpha):
 class AudioPeekabooSeparator(nn.Module):    
     def __init__(self, 
                  data,
+                 dataset,
                  device,
                  num_label=1,
                  representation='raster',):
 
         super().__init__()
-        self.data = data  # data['log_mel_spec']: [B,1024,64]
-        self.height = data['log_mel_spec'].shape[1]  # 1024
-        self.width = data['log_mel_spec'].shape[2]  # 64
+        self.data = data  # data['log_mel_spec']: [B,1024,64] / data['stft']: [B,t-steps,f-bins]
+        self.height = data['stft'].shape[1]  # 1024
+        self.width = data['stft'].shape[2]  # 64 X -> 1024
+        self.dataset = dataset
+        self.device = device
         self.num_label = num_label  # 1
         self.representation = representation
         
-        self.foreground = data['log_mel_spec'].to(device)  # [1, t-steps, mel-bins]
-        self.alpha = make_learnable_image(self.height, self.width, num_channels=self.num_label, representation=self.representation)  # [num_label, H, W]
-    
+        # self.foreground = data['log_mel_spec'].to(device)  # [1, t-steps, mel-bins]
+        # self.alpha = make_learnable_image(self.height, self.width, num_channels=self.num_label, representation=self.representation)  # [num_label, H, W]
+        self.foreground = data['stft'].to(device)  # tensor, [B, t-steps, f-bins]
+        self.alpha = LearnableImageRaster(self.height, self.width, self.num_label)
+
     @property
     def num_labels(self):
         return self.num_label
@@ -70,8 +75,11 @@ class AudioPeekabooSeparator(nn.Module):
     def forward(self, alpha=None, return_alpha=False):        
         alpha = alpha if alpha is not None else self.alpha()
         masked_log_mel_spec = masking_torch_image(self.foreground, alpha)
-        self.data['log_mel_spec'] = masked_log_mel_spec
-        
+
+        self.data['stft'] = masked_log_mel_spec.float()
+        mel = self.dataset.spectral_normalize_torch(torch.matmul(self.dataset.mel_basis[str(self.dataset.mel_fmax) + "_" + str(self.device)], masked_log_mel_spec))
+        self.data['log_mel_spec'] = self.dataset.pad_spec(torch.FloatTensor(mel[0].T)).unsqueeze(0).float()
+
         assert not torch.isnan(alpha).any() or not torch.isinf(alpha).any(), "alpha contains NaN or Inf values"  # NaN이나 Inf 값 체크
 
         return (self.data, alpha) if return_alpha else self.data
@@ -330,7 +338,7 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
 
     fname, f_alpha, f_sep_mel = setting_result_folder(sep_data1['text'][0])
 
-    pkboo = AudioPeekabooSeparator(sep_data1, latent_diffusion.device, representation=REPRESENTATION).to(device)
+    pkboo = AudioPeekabooSeparator(sep_data1, dataset, device, representation=REPRESENTATION).to(device)
     params = list(pkboo.parameters())
     for param in pkboo.parameters():
         param.requires_grad = True
@@ -433,17 +441,56 @@ def run_pkboo(configs, config_yaml_path, exp_group_name, exp_name, perform_valid
     # 3. 이미지 파일로 저장하고 로스 기록하는거 구현
     #########################################
     '''
-    
-def training_step(composite_batch, latent_diffusion, guidance_scale):
+'''
+    def train_step(self, text_embeddings: torch.Tensor, pred_rgb: torch.Tensor, guidance_scale: float = 100, t: Optional[int] = None):
 
-    unconditional_prob_cfg = 0.0  # 수정 요함
-    x, c = latent_diffusion.get_input(composite_batch, latent_diffusion.first_stage_key, unconditional_prob_cfg=unconditional_prob_cfg)
+        pred_rgb_512 = F.interpolate(pred_rgb, (512, 512), mode='bilinear', align_corners=False).to(torch.float16) ##
+
+        if t is None:
+            t = torch.randint(self.min_step, self.max_step + 1, [1], dtype=torch.long, device=self.device)
+
+        # VAE를 사용하여 이미지를 latents로 인코딩 / grad 필요.
+        latents = self.encode_imgs(pred_rgb_512)
+
+        # unet으로 noise residual 예측 / NO grad.
+        with torch.no_grad():
+            noise = torch.randn_like(latents)
+            latents_noisy = self.scheduler.add_noise(latents, noise, t.cpu())
+            # pred noise
+            latent_model_input = torch.cat([latents_noisy] * 2)
+            noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings)['sample']
+
+        # guidance 수행 (high scale from paper)
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+
+        # w(t), sigma_t^2   
+        w = (1 - self.alphas[t])
+        grad = w * (noise_pred - noise)
+
+        # grad에서 item을 생략하고 자동 미분 불가능하므로, 수동 backward 수행.
+        latents.backward(gradient=grad, retain_graph=True)
+        return 0  # dummy loss value
+'''
+def training_step(composite_batch, latent_diffusion, guidance_scale=100):
+
+    x, cond = latent_diffusion.get_input(composite_batch, latent_diffusion.first_stage_key, unconditional_prob_cfg=0.0)
+    print(cond.keys())
+    print(cond[0])
+    x, uncond = latent_diffusion.get_input(composite_batch, latent_diffusion.first_stage_key, unconditional_prob_cfg=0.0)
+    print(uncond.keys())
+    print(uncond[0])
+
+    assert cond[0] != uncond[0], f'Cond:\n{cond[0]}\n\nUncond\n{uncond[0]}'
 
     with torch.no_grad():
-        t = torch.randint(0, int(latent_diffusion.num_timesteps * 0.7) , (x.shape[0],), device=latent_diffusion.device).long()         ############   t 조정
+        t = torch.randint(int(latent_diffusion.num_timesteps * 0.02), int(latent_diffusion.num_timesteps * 0.98) + 1 , (x.shape[0],), device=latent_diffusion.device).long()         ############   t 조정
         noise = torch.randn_like(x)
         x_noisy = latent_diffusion.q_sample(x_start=x, t=t, noise=noise)
-        pred_noise = latent_diffusion.apply_model(x_noisy, t, c)
+        print(x_noisy.shape())
+        pred_noise_text = latent_diffusion.apply_model(x_noisy, t, cond)
+        pred_noise_uncond = latent_diffusion.apply_model(x_noisy, t, uncond)
+        pred_noise = pred_noise_uncond + guidance_scale * (pred_noise_text - pred_noise_uncond)
 
     # w(t), sigma_t^2 
     w = (1 - latent_diffusion.alphas_cumprod[t])
@@ -453,7 +500,7 @@ def training_step(composite_batch, latent_diffusion, guidance_scale):
 
     # grad에서 item을 생략하고 자동 미분 불가능하므로, 수동 backward 수행.
     x.backward(gradient=grad, retain_graph=True)
-
+    
     return custom_mse_loss  # dummy loss value
 
 

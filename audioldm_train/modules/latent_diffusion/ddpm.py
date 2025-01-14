@@ -907,7 +907,7 @@ class LatentDiffusion(DDPM):
         unconditional_prob_cfg=0.1,
     ):
         x = super().get_input(batch, k).to(self.device)
-        
+        assert k=='fbank', f"first_stage_key is {k}"  #####
         # Generate first stage encoding if required
         z = None
         encoder_posterior = None
@@ -918,7 +918,10 @@ class LatentDiffusion(DDPM):
 
         cond_dict = {}
         if len(self.cond_stage_model_metadata.keys()) > 0:
+            print(self.cond_stage_model_metadata.keys())  #####
+            
             unconditional_cfg = self.conditional_dry_run_finished and self.make_decision(unconditional_prob_cfg)  # True/False
+            print(f"unconditional_cfg is {unconditional_cfg} & {self.conditional_dry_run_finished}/{self.make_decision(unconditional_prob_cfg)}")  #####
             
             # Process each conditional model
             for cond_model_key, metadata in self.cond_stage_model_metadata.items():
@@ -928,6 +931,8 @@ class LatentDiffusion(DDPM):
                 # Get conditional input (conditioning에 사용될 original data, cond_model_key: "all"이면 cond_model이 batch의 모든 정보를 필요로 함)
                 cond_stage_key = metadata["cond_stage_key"]
                 xc = batch if cond_stage_key == "all" else super().get_input(batch, cond_stage_key)
+                print(f'cond_stage_key:{cond_stage_key}')  #####
+                print(f'xc:{xc}')  #####
 
                 if isinstance(xc, torch.Tensor):
                     xc = xc.to(self.device)
